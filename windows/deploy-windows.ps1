@@ -21,6 +21,14 @@
 .PARAMETER WorkingDirectory
     Working directory for the session. Defaults to the system drive root.
 
+.PARAMETER ProbeHost
+    Host the service's startup network probe must reach before launching the
+    session. Defaults to api.anthropic.com.
+
+.PARAMETER ProbeTimeoutSeconds
+    How long the probe waits for the network before failing the start and
+    letting the SCM restart action retry. Defaults to 300.
+
 .PARAMETER Uninstall
     Stop and remove the service and its install directory.
 
@@ -31,6 +39,8 @@
 param(
     [string]$SessionName = $env:COMPUTERNAME,
     [string]$WorkingDirectory = "$env:SystemDrive\",
+    [string]$ProbeHost = 'api.anthropic.com',
+    [int]$ProbeTimeoutSeconds = 300,
     [switch]$Uninstall
 )
 
@@ -217,12 +227,22 @@ $svcEnv = @(
     "PATH=$env:Path",
     "CLAUDE_RC_EXE=$childExe",
     "CLAUDE_RC_ARGS=$childArgs",
-    "CLAUDE_RC_CWD=$WorkingDirectory"
+    "CLAUDE_RC_CWD=$WorkingDirectory",
+    "CLAUDE_RC_PROBE_HOST=$ProbeHost",
+    "CLAUDE_RC_PROBE_TIMEOUT=$ProbeTimeoutSeconds"
 )
 $svcKey = "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName"
 New-ItemProperty -Path $svcKey -Name 'Environment' -PropertyType MultiString -Value $svcEnv -Force | Out-Null
 
-# Restart the whole service if the wrapper itself ever dies.
+# Delayed auto-start plus a dependency on the TCP/IP and DNS client services.
+# Neither guarantees usable connectivity on its own -- the wrapper's own probe
+# does the real waiting -- but both move the start well past the worst of the
+# boot-time race, so the probe rarely has to loop.
+sc.exe config $ServiceName start= delayed-auto | Out-Null
+sc.exe config $ServiceName depend= Tcpip/Dnscache | Out-Null
+
+# Restart the whole service if the wrapper itself ever dies -- including the
+# deliberate exit(1) the wrapper takes when the network probe times out.
 sc.exe failure $ServiceName reset= 86400 actions= restart/10000/restart/10000/restart/10000 | Out-Null
 
 Start-Service -Name $ServiceName

@@ -16,12 +16,17 @@ immediately reachable from claude.ai/code — no reboot required.
 
 ## Switches
 
-Every script takes the same two options:
+Every script takes the same options:
 
 - **Session name** — `-n` / `--session-name` (Linux/macOS), `-SessionName`
   (Windows). Defaults to the machine's hostname.
 - **Working directory** — `-w` / `--workdir` (Linux/macOS),
   `-WorkingDirectory` (Windows). Defaults to the system root (`/` or `C:\`).
+- **Probe host** — `--probe-host` (Linux/macOS), `-ProbeHost` (Windows). The
+  host the boot-time network gate must reach. Defaults to `api.anthropic.com`.
+- **Probe timeout** — `--probe-timeout` (Linux/macOS),
+  `-ProbeTimeoutSeconds` (Windows). Seconds to wait for the network before
+  failing the start so the restart policy retries. Defaults to `300`.
 
 Each script also accepts `--uninstall` / `-Uninstall` to remove the service.
 
@@ -32,10 +37,13 @@ Each script also accepts `--uninstall` / `-Uninstall` to remove the service.
    setting `projects.<workdir>.hasTrustDialogAccepted = true` (and
    `hasCompletedProjectOnboarding`) so the session never blocks on the trust
    dialog.
-3. Install a boot-time service that runs
+3. Install a network preflight gate at `/usr/local/libexec/claude-rc-preflight`
+   (Unix) or compile it into the service wrapper (Windows), and make the
+   service launch the session only once that gate reports the API reachable.
+4. Install a boot-time service that runs
    `claude --remote-control <session-name>` in the chosen working directory,
    restarting it automatically if it exits.
-4. Start the service immediately.
+5. Start the service immediately.
 
 ## Usage
 
@@ -73,6 +81,53 @@ Claude Code's interactive UI requires a terminal, which services don't have:
   in session 0), which satisfies the TTY check. The service runs as
   LocalSystem, with per-service environment variables (`USERPROFILE`, `PATH`,
   …) pointing it at the deploying user's Claude profile.
+
+## Why there is a network preflight gate
+
+Without it, these services reliably come up **disconnected after a reboot** and
+need a manual restart. Two things combine:
+
+**1. "Network is online" is a lie.** On Ubuntu with netplan,
+`systemd-networkd-wait-online` carries a generated drop-in at
+`/run/systemd/system/systemd-networkd-wait-online.service.d/10-netplan.conf`:
+
+```ini
+[Unit]
+ConditionPathIsSymbolicLink=/run/systemd/generator/network-online.target.wants/systemd-networkd-wait-online.service
+```
+
+When netplan does not create that symlink, the waiter is silently skipped and
+`network-online.target` is reached in milliseconds with nothing behind it, so
+`After=network-online.target` buys nothing. Observed on a real host: the target
+was reached at `10:25:22.687`, the service started at `10:25:22.692`, and the
+interface did not get its DHCP lease until `10:25:25.78` — the session tried to
+connect **3.1 seconds before the machine had an IP address**. macOS `RunAtLoad`
+and Windows automatic-start have the same hazard.
+
+**2. The failure does not self-heal.** Remote Control session creation is a
+one-shot at startup. When it fails, `claude` does **not** exit — it stays
+running and displays `/rc failed`. Because nothing exited, `Restart=always`
+(systemd), `KeepAlive` (launchd), and the wrapper's `Exited` hook (Windows)
+never fire. `systemctl status` cheerfully reports `active (running)` over a
+session that is permanently disconnected.
+
+So the gate blocks the launch until an actual HTTPS connection to the probe host
+succeeds — proving DNS, routing, and TLS all work, not merely that an address is
+configured. If the gate times out it exits non-zero, which *does* trip the
+restart policy, so a slow or flapping network converges instead of wedging.
+
+Supporting details per platform:
+
+- **Linux** — `ExecStartPre=` runs the gate. `TimeoutStartSec` is raised above
+  the probe budget (systemd would otherwise kill the start mid-wait) and
+  `StartLimitIntervalSec=0` keeps a long outage from burning the default
+  5-starts-per-10s budget and wedging the unit in `failed`.
+- **macOS** — launchd has no `ExecStartPre`, so the gate and the session share
+  one `bash -c` invocation and the session is `exec`d, keeping the supervised
+  pid the session itself.
+- **Windows** — the probe runs on a worker thread, because the SCM kills a
+  service whose `OnStart` blocks longer than ~30s. The service is also set to
+  delayed auto-start and to depend on `Tcpip`/`Dnscache`.
 
 ## Caveats
 

@@ -8,6 +8,7 @@ set -euo pipefail
 LABEL="com.claude.remote-control"
 PLIST_PATH="/Library/LaunchDaemons/${LABEL}.plist"
 LOG_PATH="/var/log/claude-remote-control.log"
+PREFLIGHT_PATH="/usr/local/libexec/claude-rc-preflight"
 
 usage() {
   cat <<'EOF'
@@ -15,6 +16,10 @@ Usage: sudo ./deploy-macos.sh [options]
 
   -n, --session-name NAME  Remote Control session name (default: hostname)
   -w, --workdir DIR        Working directory for the session (default: /)
+      --probe-host HOST    Host the startup network probe must reach
+                           (default: api.anthropic.com)
+      --probe-timeout SEC  How long to wait for the network before failing the
+                           start and letting launchd retry (default: 300)
       --uninstall          Stop and remove the LaunchDaemon
   -h, --help               Show this help
 EOF
@@ -22,12 +27,16 @@ EOF
 
 SESSION_NAME="$(scutil --get LocalHostName 2>/dev/null || hostname)"
 WORKDIR="/"
+PROBE_HOST="api.anthropic.com"
+PROBE_TIMEOUT=300
 UNINSTALL=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -n|--session-name) SESSION_NAME="$2"; shift 2 ;;
     -w|--workdir)      WORKDIR="$2"; shift 2 ;;
+    --probe-host)      PROBE_HOST="$2"; shift 2 ;;
+    --probe-timeout)   PROBE_TIMEOUT="$2"; shift 2 ;;
     --uninstall)       UNINSTALL=1; shift ;;
     -h|--help)         usage; exit 0 ;;
     *) echo "Unknown argument: $1" >&2; usage; exit 1 ;;
@@ -41,7 +50,7 @@ fi
 
 if [[ $UNINSTALL -eq 1 ]]; then
   launchctl bootout "system/${LABEL}" 2>/dev/null || true
-  rm -f "$PLIST_PATH"
+  rm -f "$PLIST_PATH" "$PREFLIGHT_PATH"
   echo "Removed ${LABEL}."
   exit 0
 fi
@@ -112,6 +121,70 @@ if [[ ! -f "$HOME_DIR/.claude/.credentials.json" ]]; then
   echo "cannot read it at boot. Consider 'claude setup-token' or an API key." >&2
 fi
 
+# Install the network preflight gate.
+#
+# Why this exists: RunAtLoad fires before the machine reliably has DHCP, DNS, or
+# a default route, and Claude Code's Remote Control session creation is a
+# one-shot at startup: on failure the process does NOT exit, it keeps running
+# and shows "/rc failed". KeepAlive therefore never fires (nothing exited) and
+# the daemon looks healthy while being permanently disconnected, recoverable
+# only by a manual restart. Gating launch on real reachability prevents that.
+mkdir -p "$(dirname "$PREFLIGHT_PATH")"
+cat > "$PREFLIGHT_PATH" <<'PFEOF'
+#!/usr/bin/env bash
+# Blocks until the Claude API is genuinely reachable, then exits 0.
+# Exits 1 on timeout so the caller's restart policy tries again.
+#
+# Usage: claude-rc-preflight [HOST] [PORT] [TOTAL_TIMEOUT_SECONDS]
+set -u
+
+HOST="${1:-api.anthropic.com}"
+PORT="${2:-443}"
+TOTAL_TIMEOUT="${3:-300}"
+CONNECT_TIMEOUT=5
+SLEEP_BETWEEN=2
+
+probe() {
+  if command -v curl >/dev/null 2>&1; then
+    # Any HTTP response proves DNS + routing + TLS all work end to end; the
+    # status code itself is irrelevant.
+    curl -sS --max-time "$CONNECT_TIMEOUT" -o /dev/null "https://${HOST}:${PORT}/" >/dev/null 2>&1
+    return $?
+  fi
+  # Fallback: a raw TCP connect via bash's /dev/tcp. Backgrounded and killed by
+  # hand rather than wrapped in 'timeout', which macOS does not ship.
+  ( exec 3<>"/dev/tcp/${HOST}/${PORT}" ) >/dev/null 2>&1 &
+  local pid=$! waited=0
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ "$waited" -ge "$CONNECT_TIMEOUT" ]; then
+      kill -9 "$pid" >/dev/null 2>&1
+      wait "$pid" 2>/dev/null
+      return 1
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  wait "$pid"
+}
+
+start="$(date +%s)"
+attempt=0
+while :; do
+  attempt=$((attempt + 1))
+  if probe; then
+    echo "claude-rc-preflight: ${HOST}:${PORT} reachable after ${attempt} attempt(s), $(( $(date +%s) - start ))s"
+    exit 0
+  fi
+  if [ "$(( $(date +%s) - start ))" -ge "$TOTAL_TIMEOUT" ]; then
+    echo "claude-rc-preflight: ${HOST}:${PORT} unreachable after ${TOTAL_TIMEOUT}s; failing so the service restarts" >&2
+    exit 1
+  fi
+  sleep "$SLEEP_BETWEEN"
+done
+PFEOF
+chmod 755 "$PREFLIGHT_PATH"
+echo "Installed network preflight gate at $PREFLIGHT_PATH"
+
 # '/usr/bin/script' allocates a pty so Claude Code's interactive UI can run
 # headless; its own stdout is copied to the log file.
 cat > "$PLIST_PATH" <<EOF
@@ -120,14 +193,15 @@ cat > "$PLIST_PATH" <<EOF
 <plist version="1.0">
 <dict>
   <key>Label</key><string>${LABEL}</string>
+  <!-- launchd has no ExecStartPre, so the preflight gate and the session share
+       one bash invocation: wait for real connectivity, then exec the session so
+       the pid launchd supervises is the session itself. A failed probe exits
+       non-zero, and KeepAlive retries after ThrottleInterval. -->
   <key>ProgramArguments</key>
   <array>
-    <string>/usr/bin/script</string>
-    <string>-q</string>
-    <string>/dev/null</string>
-    <string>${CLAUDE_BIN}</string>
-    <string>--remote-control</string>
-    <string>${SESSION_NAME}</string>
+    <string>/bin/bash</string>
+    <string>-c</string>
+    <string>${PREFLIGHT_PATH} ${PROBE_HOST} 443 ${PROBE_TIMEOUT} &amp;&amp; exec /usr/bin/script -q /dev/null '${CLAUDE_BIN}' --remote-control '${SESSION_NAME}'</string>
   </array>
   <key>UserName</key><string>${SERVICE_USER}</string>
   <key>WorkingDirectory</key><string>${WORKDIR}</string>
